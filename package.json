@@ -1,0 +1,13 @@
+{
+  "name": "a-better-rent-site",
+  "private": true,
+  "version": "1.0.0",
+  "description": "ABR static site with Netlify Functions",
+  "license": "UNLICENSED",
+  "engines": {
+    "node": "18.x"
+  },
+  "dependencies": {
+    "stripe": "^16.0.0"
+  }
+}

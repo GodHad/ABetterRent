@@ -1,0 +1,1634 @@
+<!-- A Better Rent — Purely Connecting™ | Mr Connect 🤖
+     Brand Ambassador / Trust Guardian · All-Inclusive · One-File · Drop-In
+     v2.0.0 (2025-11-13)
+
+     What this file gives you:
+     - Compliance & Safety Engine (CFS) that rewrites risky phrasing into ABR-safe language
+     - Tiered trust (Acquaintance/Ally/Guardian) with TF formula and guardrails
+     - Region/IP soft gate hook (county pilot) + friendly UX hinting
+     - Post assistant + availability tags ([avail: ...]) → friendly line injection
+     - Start connection → mutual confirm → gated contact release → required quick reviews
+     - Offline-first “micro-backend” so the entire flow demos without servers
+     - Net-ready API proxy with queue & sync (turn on your real endpoints later)
+     - Telemetry stub (low-noise), a11y/keyboard support, focus management, reduced-motion
+     - Reputational Trust XP (RTXP) per experience:
+         Character 1–10, Quality 1–10, Contribution 1–10 → RTXP gain 0–100
+     - New v2 visual: larger bouncing avatar, sunrise glow, and fixed label:
+         “Hi! I’m Mr Connect” always visible under the bot in the corner.
+
+     Ownership:
+     “A Better Rent — Purely Connecting™” wording, safety logic, RTXP model,
+     and UI language are proprietary to A Better Rent LLC.
+-->
+<script>
+(function(){
+/* ========================================================================
+   CONFIG & CONSTANTS
+   ======================================================================== */
+
+const ABR_MISSION =
+  "A P2P shared-resources ledger of tools, spaces, skills, and time — curated for verified, local neighbors to discover and create real-world connections and experiences.";
+
+const ABR_VERSION = "mr-connect.v2.0.0";
+
+/* ----------- Core configuration: APIs, trust weights, thresholds ----------- */
+const CFG = {
+  apiDev:   "https://api.abr-connector.local",
+  apiProd:  "https://api.your-prod-backend.com",    // ← set your prod base
+  signup:   "https://abetterrent.com/founders",      // ← public signup/landing
+
+  // Trust-tier cutoffs (0–100 TF)
+  thresholds: {
+    ally: 40,
+    guardian: 80
+  },
+
+  // Trust Factor (TF) weights:
+  // C = Character, Q = Quality, K = Contribution, RTX = Reputational Trust XP (0–100 scaled back to 0–10)
+  weights: {
+    C: 0.30,
+    Q: 0.35,
+    K: 0.20,
+    RTX: 0.15
+  }
+};
+
+/* ----------- Feature flags for easy editing -------------------------------- */
+const FLAGS = {
+  requireCountyGate: true,                 // soft gate pilot counties
+  enforceReviewBeforeNewExperience: true,  // must review before new connections
+  enforceMutualConfirmBeforeContact: true, // reveal contacts only after mutual confirm
+  showAvailChips: true,                    // quick availability helpers
+  telemetry: true                          // emit low-noise events (safe to disable)
+};
+
+/* ----------- Environment detection (dev vs prod) --------------------------- */
+const API_BASE = (/localhost|127\.0\.0\.1|dev|staging/i.test(location.hostname))
+  ? CFG.apiDev
+  : CFG.apiProd;
+
+/* ----------- Base user object (can be overridden via window.ABR_CURRENT_USER) */
+const ABR_USER = window.ABR_CURRENT_USER || {
+  id: "anon",
+  display_name: "Neighbor",
+  regionId: "unknown",
+  zip_code: "00000",
+  verifiedLevel: "none",
+  // Trust “skill bars” (0–100 each; RTX is 0–100 XP)
+  trust: { C: 50, Q: 50, K: 50, RTX: 50, TF: 0, tier: "Acquaintance" },
+  isFoundingMember: false,
+  isGuardian: false,
+  expertiseLabels: ["Community Helper"]
+};
+
+let ABR_BACKEND_OFFLINE_NOTIFIED = false;
+
+/* ========================================================================
+   TRUST / TIERS / RTXP HELPERS
+   ======================================================================== */
+
+function clamp01(x){
+  return Math.max(0, Math.min(100, Number.isFinite(x) ? x : 0));
+}
+
+/* ---- Compute Trust Factor (TF) from C/Q/K/RTX using CFG.weights ---------- */
+/* Note: RTX is stored 0–100, but treated as 0–10 inside TF via /10. */
+function computeTF(t){
+  const w = CFG.weights;
+  const C = clamp01(t.C);
+  const Q = clamp01(t.Q);
+  const K = clamp01(t.K);
+  const RTX_0_10 = clamp01(t.RTX) / 10; // convert 0–100 XP → 0–10 scale
+  return Math.round(
+    w.C   * C +
+    w.Q   * Q +
+    w.K   * K +
+    w.RTX * RTX_0_10
+  );
+}
+
+/* ---- Map TF → tier name --------------------------------------------------- */
+function tierFromTF(tf, T = CFG.thresholds){
+  if (tf >= T.guardian) return "Guardian";
+  if (tf >= T.ally)     return "Ally";
+  return "Acquaintance";
+}
+
+/* ---- Initialize trust tiers on load -------------------------------------- */
+(function initTrust(){
+  const t = ABR_USER.trust || {};
+  t.TF   = t.TF   || computeTF(t);
+  t.tier = t.tier || tierFromTF(t.TF);
+  ABR_USER.trust      = t;
+  ABR_USER.trust_tier = t.tier;
+})();
+
+/* ---- Tier caps: suggestions, cooldown, idle hint ------------------------- */
+const TIER_CAPS = {
+  Acquaintance: { maxSugs: 2, cooldown: 2400, hint: "Hi! 👋 I’m Mr Connect" },
+  Ally:         { maxSugs: 3, cooldown: 1200, hint: "Howdy Neighbor! 👋" },
+  Guardian:     { maxSugs: 4, cooldown:  600, hint: "Welcome back, Guardian 🛡️" }
+};
+
+function caps(){
+  return TIER_CAPS[ABR_USER.trust.tier] || TIER_CAPS.Acquaintance;
+}
+
+/* ========================================================================
+   MICRO STORE & SESSION (offline demo)
+   ======================================================================== */
+
+const Store = {
+  get(k, d){
+    try { return JSON.parse(localStorage.getItem(k)) ?? d; }
+    catch(_) { return d; }
+  },
+  set(k, v){
+    localStorage.setItem(k, JSON.stringify(v));
+  },
+  push(k, v){
+    const a = Store.get(k, []);
+    a.push(v);
+    Store.set(k, a);
+    return a;
+  }
+};
+
+const nowISO = () => new Date().toISOString();
+const newId  = (p = "id") => `${p}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2,7)}`;
+
+/* ---- Session snapshot (stays local for demo) ----------------------------- */
+const SESSION = Store.get("abr_session", {
+  user: ABR_USER,
+  csrf: "",
+  online: true,
+  lastSync: 0,
+  id: newId("sess")
+});
+
+function saveSession(){
+  Store.set("abr_session", SESSION);
+}
+
+/* ---- Mini “tables” for offline micro-backend ----------------------------- */
+["abr_users","abr_connections","abr_reviews","abr_queue"].forEach(k=>{
+  if (!Store.get(k)) Store.set(k, []);
+});
+
+const DB_KEYS = {
+  users:       "abr_users",
+  connections: "abr_connections",
+  reviews:     "abr_reviews",
+  queue:       "abr_queue"
+};
+
+/* ========================================================================
+   SAFETY ENGINE (CFS)
+   ======================================================================== */
+/* The CFS rewrites risky phrasing into ABR-safe public invites.
+   It removes prices, rentals, private addresses, and high-risk terms. */
+
+/* ----------- Phrase families ---------------------------------------------- */
+const RX_ILLEGAL = [
+  /\b(unregistered gun|ghost gun|sell you a gun|serial[- ]?off|no serial)\b/i,
+  /\b(fentanyl|oxy(?:codone)?|perc(?:ocet)?|credit card dump|skim data|stolen\b.+(bike|car|gear))\b/i
+];
+const RX_THREAT  = [
+  /\bi[' ]?m going to (hurt|kill|beat|jump)\b/i,
+  /\b(meet or else|do what i say)\b/i
+];
+const RX_PRICE   = [
+  /\$ ?\d+(\.\d{1,2})? ?(per|a)? ?(hour|hr|day|night|week|wk)\b/gi,
+  /\$ ?\d+(\.\d{1,2})?/g,
+  /\b(cash only|my rate|i charge|rental fee|deposit required|booking fee)\b/gi,
+  /\b(\d+\s?(bucks|dollars))\b/gi
+];
+const RX_RENTAL  = [
+  /\bfor\s*rent\b/gi,
+  /\brent (you|u|ya|my)\b/gi,
+  /\bdaily rental\b/gi,
+  /\bfor hire\b/gi,
+  /\b(book|reserve) (me|now|this|a slot)\b/gi,
+  /\bavailable to hire\b/gi
+];
+const RX_UNSAFE  = [
+  /\b(come (alone|by yourself) (to|2) (my|this) (house|place|apartment|apt|garage|yard|backyard)|come to my place alone)\b/gi,
+  /\b(meet (me )?behind\b.+(gas station|store|parking lot).*(midnight|late))\b/gi,
+  /\b(no cops|don't tell anyone|keep this secret)\b/gi
+];
+const RX_LIAB    = [
+  /\b(i (take|assume) full responsibility)\b/gi,
+  /\b(i'?m insured|fully insured|covered by my insurance)\b/gi,
+  /\b(i guarantee it(’s|'s)? safe|i guarantee nothing will break)\b/gi
+];
+const RX_COMM    = [
+  /\b(book (a )?slot)\b/gi,
+  /\bmy (availability|openings?)\b/gi,
+  /\btime slots?\b/gi,
+  /\baccepting clients?\b/gi
+];
+const RX_PRIV    = [
+  /\b(swing by|pull up|come thru|come through)\s+(to|2)?\s*(my|the)\s*(house|place|yard|garage|backyard)\b/gi,
+  /\bmeet (me )?(in|at) my (garage|yard|backyard|driveway)\b/gi
+];
+const RX_BROKER  = [
+  /\b(i'?ll|i will) hook you up\b/gi,
+  /\bwe'?re fully insured\b/gi,
+  /\bthe platform (covers|insures|guarantees)\b/gi
+];
+const RX_BOOKY   = /\b(book|booking|reserve|reservation|slot|time slot|appointment|hold|deposit)\b/gi;
+
+/* ----------- Language map transforms -------------------------------------- */
+const PUBLIC_LANGUAGE_MAP = [
+  { key:/\bfor\s*hire\b/gi,
+    compliant:"I'm open to respectfully connecting in daylight — not for hire. A Better Rent - Purely Connecting™.",
+    mode:"rewrite" },
+  { key:/\bfor\s*rent\b/gi,
+    compliant:"Open to coordinating respectfully — not a rental, just neighbors. A Better Rent - Purely Connecting™.",
+    mode:"rewrite" },
+  { key:/\b(book (me|now|a slot|time)|reserve (me|now|a spot))\b/gi,
+    compliant:"Let’s talk first and, if it feels right, meet in public.",
+    mode:"rewrite" },
+  { key:/\bmy rate(s?)\b/gi, compliant:"", mode:"block" },
+  { key:/\$ ?\d+(\.\d{1,2})?/g, compliant:"", mode:"block" },
+  { key:/\bvenmo\b|\bcashapp\b|\bpaypal\b/gi,
+    compliant:"[payment info removed]", mode:"rewrite" },
+  { key:/\b(hit|text|call|dm)\s+me\s+(here|now|direct(ly)?|privately?)\b/gi,
+    compliant:"Reply here and we’ll choose a public spot after mutual agreement.",
+    mode:"rewrite" },
+  { key:/\bcome (to|2) my (house|place|apartment|apt|garage|yard|backyard)\b/gi,
+    compliant:"Let’s pick a safe, public place we both like.",
+    mode:"rewrite" },
+  { key:/\b(no cops|don't tell anyone|keep this secret)\b/gi,
+    compliant:"", mode:"block" },
+  { key:/\b(fully insured|100% safe guaranteed|i take full responsibility)\b/gi,
+    compliant:"Please act responsibly; ABR doesn’t broker, own, or insure arrangements.",
+    mode:"rewrite" },
+  { key:/\b(meet (me )?behind\b.+(gas station|store|parking lot).*(midnight|late))\b/gi,
+    compliant:"", mode:"block" },
+  { key:/\b(stolen|hot merch|fell off a truck)\b/gi,
+    compliant:"", mode:"block" }
+];
+
+/* ----------- Safety helpers ----------------------------------------------- */
+function normalize(t=""){
+  return t.replace(/\r\n/g,"\n").replace(/\t/g," ")
+          .replace(/[ ]{2,}/g," ").trim();
+}
+function has(rxArr,txt){
+  return rxArr.some(rx=>rx.test(txt));
+}
+function applyLangMap(txt){
+  let t = txt, blocked = false, rewrote = false, reasons = [];
+  PUBLIC_LANGUAGE_MAP.forEach(r=>{
+    if(r.key.test(t)){
+      r.key.lastIndex = 0;
+      if(r.mode==="block"){
+        blocked = true; reasons.push("blocked");
+      } else {
+        t = t.replace(r.key, r.compliant);
+        rewrote = true; reasons.push("rewrite");
+      }
+    }
+  });
+  return {
+    text: t.replace(/[ ]{2,}/g," ").trim(),
+    blocked,
+    rewrote,
+    reasons
+  };
+}
+function scrubContacts(t="",phase="public"){
+  let u = t, touched = {phone:false,email:false,pay:false};
+  if(phase!=="matched_private"){
+    u = u.replace(/(\+?\d[\d\-\(\) ]{7,}\d)/g,()=>{
+      touched.phone = true;
+      return "[contact hidden until both agree]";
+    });
+    u = u.replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi,()=>{
+      touched.email = true;
+      return "[contact hidden until both agree]";
+    });
+  }
+  u = u.replace(
+    /(\$[a-z0-9_]{3,}|venmo\s*@?[a-z0-9_]{3,}|cashapp\s*@?[a-z0-9_]{3,}|paypal\s*@?[a-z0-9_]{3,})/gi,
+    ()=>{
+      touched.pay = true;
+      return "[payment info removed]";
+    }
+  );
+  return { text:u, touched };
+}
+function removePricingRental(t){
+  let u = t, touches = {price:false, rental:false};
+  RX_PRICE.forEach(rx=>{
+    if(rx.test(u)) touches.price = true;
+    u = u.replace(rx,"");
+  });
+  RX_RENTAL.forEach(rx=>{
+    if(rx.test(u)) touches.rental = true;
+    u = u.replace(rx,"connect");
+  });
+  u = u.replace(/\b(i[' ]?ll|i will)\s+rent\s+you\s+my\b/gi,
+                "I may be able to connect with someone about my");
+  return { text:u.replace(/[ ]{2,}/g," ").trim(), touches };
+}
+function saferMeet(t){
+  let u = t, found = false;
+  RX_UNSAFE.forEach(rx=>{
+    if(rx.test(u)) found = true;
+    u = u.replace(rx,"let's pick a comfortable public place we both like");
+  });
+  return { text:u.replace(/[ ]{2,}/g," ").trim(), found };
+}
+function scrubLiability(t){
+  let u = t, found = false;
+  RX_LIAB.forEach(rx=>{
+    if(rx.test(u)) found = true;
+    u = u.replace(
+      rx,
+      "Please act responsibly. A Better Rent - Purely Connecting™ does not broker, own, or insure arrangements."
+    );
+  });
+  return { text:u.replace(/[ ]{2,}/g," ").trim(), found };
+}
+function softenTone(t){
+  let u = t;
+  RX_COMM.forEach(rx => u = u.replace(rx,"I may be open to connecting and coordinating together"));
+  RX_PRIV.forEach(rx => u = u.replace(rx,"let's pick a comfortable public place we both like"));
+  RX_BROKER.forEach(rx => u = u.replace(rx,"We can respectfully connect in a way that feels safe for everyone"));
+  return u
+    .replace(/\b(transaction|deal|arrangement|hire|rental|rate|client|clients)\b/gi,"connection")
+    .replace(/[ ]{2,}/g," ")
+    .trim();
+}
+function attachFooter(main="",zip=""){
+  const base = (main || "Open to a simple local connection if it feels like a good fit.").trim();
+  const parts = [];
+  if(zip) parts.push(`Located near ${zip}.`);
+  parts.push(ABR_MISSION);
+  parts.push("A Better Rent - Purely Connecting™ — neighbors coordinating respectfully, not renting or brokering. Meet in public. Keep it low-pressure.");
+  return base + "\n\n" + parts.join(" ");
+}
+
+/* ---- Availability tags [avail: ...] -------------------------------------- */
+function parseAvailTags(text){
+  const m = text.match(/\[avail:([^\]]+)\]/ig);
+  if(!m) return [];
+  return m.flatMap(tag =>
+    tag
+      .replace(/\[avail:/i,"")
+      .replace("]","")
+      .split("|")
+      .map(s=>s.trim())
+      .filter(Boolean)
+  );
+}
+function renderAvailLine(a){
+  return a.length
+    ? ("Open " + a.join(" • ") + " — if it feels good to both of us, in a public spot.")
+    : "";
+}
+
+/* ---- User-level red flag pre-check -------------------------------------- */
+function redFlags(user,draft){
+  let score = 0, reasons = [];
+  if((user.verifiedLevel||"none")==="none"){ score+=2; reasons.push("unverified"); }
+  if((user.id||"").startsWith("anon")){     score+=1; reasons.push("anon_id"); }
+  if((draft.match(/https?:\/\/|t\.me\/|discord\.gg/gi)||[]).length>2){
+    score+=2; reasons.push("many_links");
+  }
+  if(/\bcrypto|usdt|btc address|seed phrase|airdrop\b/i.test(draft)){
+    score+=2; reasons.push("crypto_bait");
+  }
+  if(/\bspoof|hack|crack|carding|skimmer\b/i.test(draft)){
+    score+=3; reasons.push("hack_terms");
+  }
+  return {
+    score,
+    elevated: score >= 2,
+    flagged:  score >= 3,
+    reasons
+  };
+}
+
+/* ---- Core CFS pass ------------------------------------------------------- */
+function runCfs({user_id, zip_code, draft_body, channel}){
+  let t = normalize(draft_body || "");
+
+  // normalize booking → connect
+  t = t.replace(RX_BOOKY,"connect");
+
+  // parse + strip [avail: ...] tags
+  const avail = parseAvailTags(t);
+  t = t.replace(/\[avail:[^\]]+\]/ig,"").trim();
+
+  // general language map
+  const map     = applyLangMap(t);
+  t             = map.text;
+  const illegal = has(RX_ILLEGAL,t);
+  const threat  = has(RX_THREAT,t);
+
+  if(illegal || threat || map.blocked || channel === "pre_accept_dm_attempt"){
+    return {
+      clean_body: "",
+      blocked: true,
+      compliance_risk_level: "high",
+      reason_codes: ["blocked"],
+      user_facing_note:
+        illegal
+          ? "Not allowed — keep it legal."
+          : (threat
+              ? "No threats — keep it calm."
+              : "Can’t send that as-is. Keep it public, mutual, low-pressure."),
+      trust_events: ["blocked"],
+      meta: { user_id, zip_code, channel, timestamp_iso: nowISO() }
+    };
+  }
+
+  const phase = (channel === "dm_after_accept") ? "matched_private" : "public";
+
+  const c  = scrubContacts(t, phase); t  = c.text;
+  const pr = removePricingRental(t);  t  = pr.text;
+  const sm = saferMeet(t);            t  = sm.text;
+  const li = scrubLiability(t);       t  = li.text;
+
+  t = softenTone(t);
+
+  const availLine = renderAvailLine(avail);
+  if(availLine) t = (t ? t + "\n\n" + availLine : availLine);
+
+  const final = attachFooter(t, zip_code);
+
+  const flags = {
+    removed_pricing:  pr.touches.price,
+    removed_rental:   pr.touches.rental,
+    removed_contact:  (c.touched.phone || c.touched.email || c.touched.pay),
+    removed_private:  sm.found,
+    removed_liability:li.found,
+    rewritesHappened: map.rewrote
+  };
+
+  const noteParts = [];
+  if(flags.removed_pricing || flags.removed_rental) noteParts.push("Removed pricing/rental phrasing.");
+  if(flags.removed_contact)  noteParts.push("Hid direct contact/payment until both agree.");
+  if(flags.removed_private)  noteParts.push("Shifted to a comfortable public place.");
+  if(flags.removed_liability)noteParts.push("Removed insurance/guarantee claims.");
+  if(map.reasons.length)     noteParts.push("Adjusted phrasing away from booking/broker vibes.");
+
+  return {
+    clean_body: final,
+    blocked: false,
+    compliance_risk_level:
+      (flags.removed_pricing||flags.removed_rental||flags.removed_contact||
+       flags.removed_private||flags.removed_liability||flags.rewritesHappened)
+      ? "medium"
+      : "low",
+    reason_codes: Object.entries(flags).filter(([,v])=>v).map(([k])=>k),
+    user_facing_note: noteParts.join(" ") || "Meet in public, be kind, keep it simple.",
+    trust_events: Object.entries(flags).filter(([,v])=>v).map(([k])=>k),
+    meta: { user_id, zip_code, channel, timestamp_iso: nowISO() },
+    avail // surfaced for connection creation
+  };
+}
+
+/* ========================================================================
+   LOCAL ROUTES (MICRO-BACKEND DEMO)
+   ======================================================================== */
+
+const ROUTES = {
+  /* ---- Bot bootstrap: trust tip + local ideas -------------------------- */
+  "/bot/bootstrap": ({user_id,zip})=>{
+    return {
+      ok: true,
+      trustTip: tipByTier(),
+      localIdeas:
+        `${ABR_MISSION} Neighbors around ${zip} connect in low-pressure ways (porch talks, stroller walks, mellow trail laps).`,
+      csrf: ""
+    };
+  },
+
+  /* ---- Offline signup (quick demo) ------------------------------------- */
+  "/auth/signup": ({name, zip, email, phone_optional})=>{
+    const users = Store.get(DB_KEYS.users,[]);
+    let u = users.find(x=>x.email===email);
+
+    if(!u){
+      const baseTrust = { C:50, Q:50, K:50, RTX:50 };
+      u = {
+        id: newId("u"),
+        name,
+        email,
+        zip,
+        phone: phone_optional || "",
+        verifiedLevel: "basic",
+        trust: {
+          ...baseTrust,
+          TF: computeTF(baseTrust),
+          tier: tierFromTF(computeTF(baseTrust))
+        }
+      };
+      users.push(u);
+      Store.set(DB_KEYS.users, users);
+    }
+
+    SESSION.user = { ...ABR_USER, ...u };
+    saveSession();
+
+    return {
+      ok: true,
+      user: {
+        id: u.id,
+        display_name: u.name,
+        verifiedLevel: u.verifiedLevel,
+        zip: u.zip,
+        trust: u.trust
+      }
+    };
+  },
+
+  /* ---- Connection creation --------------------------------------------- */
+  "/connections/create": ({text,tags=[],soft_availability=[],visibility="local"})=>{
+    const conns = Store.get(DB_KEYS.connections,[]);
+    const c = {
+      id: newId("conn"),
+      creator_id: SESSION.user.id || ABR_USER.id,
+      state: "open",
+      text,
+      tags,
+      soft_availability,
+      visibility,
+      created_at: nowISO(),
+      confirmations: {},
+      reviewed_by: []
+    };
+    conns.push(c);
+    Store.set(DB_KEYS.connections, conns);
+    return {
+      ok: true,
+      connection: c,
+      share_url: `/c/${c.id}`
+    };
+  },
+
+  /* ---- Mutual confirm -------------------------------------------------- */
+  "/connections/confirm": ({connection_id,did_connect})=>{
+    const conns = Store.get(DB_KEYS.connections,[]);
+    const c     = conns.find(x=>x.id===connection_id);
+    if(!c) return {ok:false,error:"not_found"};
+
+    const me = SESSION.user.id || ABR_USER.id;
+    c.confirmations[me] = !!did_connect;
+
+    const both = Object.values(c.confirmations).filter(Boolean).length >= 2;
+    if(both) c.state = "confirmed";
+
+    Store.set(DB_KEYS.connections, conns);
+
+    return {
+      ok: true,
+      state: c.state,
+      released_contacts:
+        (both && FLAGS.enforceMutualConfirmBeforeContact)
+          ? { me:"+1•••-•••-4821", other:"+1-555-555-1287" }
+          : null
+    };
+  },
+
+  /* ---- Pending reviews list ------------------------------------------- */
+  "/reviews/pending": ()=>{
+    const conns = Store.get(DB_KEYS.connections,[]);
+    const me    = SESSION.user.id || ABR_USER.id;
+
+    const pending = conns
+      .filter(c => c.state === "confirmed" && !(c.reviewed_by||[]).includes(me))
+      .map(c => ({
+        connection_id: c.id,
+        other_user: { id:"peer", display_name:"Neighbor" },
+        created_at: c.created_at
+      }));
+
+    return { ok:true, pending };
+  },
+
+  /* ----------------------------------------------------------------------
+     REVIEWS / RTXP SUBMIT ROUTE
+     - Per experience, user answers 3 questions:
+         Character 1–10, Quality 1–10, Contribution 1–10
+     - We compute experienceAvg_1_10 and RTXP_gain_0_100
+     - Smooth into long-term trust (C/Q/K/RTX), recompute TF + tier
+     ---------------------------------------------------------------------- */
+  "/reviews/submit": ({connection_id, answers})=>{
+    const reviews = Store.get(DB_KEYS.reviews,[]);
+    const me      = SESSION.user.id || ABR_USER.id;
+
+    // 1) Save raw review
+    reviews.push({
+      id: newId("rev"),
+      connection_id,
+      user_id: me,
+      answers,                      // { character_1_10, quality_1_10, contribution_1_10 }
+      created_at: nowISO()
+    });
+    Store.set(DB_KEYS.reviews, reviews);
+
+    // 2) Experience-level RTXP computation
+    const Cexp = Math.max(1, Math.min(10, +answers.character_1_10     || 1));
+    const Qexp = Math.max(1, Math.min(10, +answers.quality_1_10       || 1));
+    const Kexp = Math.max(1, Math.min(10, +answers.contribution_1_10  || 1));
+
+    const experienceAvg_1_10 = (Cexp + Qexp + Kexp) / 3;
+    const RTXP_gain_0_100    = Math.round(experienceAvg_1_10 * 10); // 1–10 → 10–100 XP
+
+    // 3) Smooth experience into long-term trust bars (C/Q/K/RTX)
+    const tOld = SESSION.user.trust || ABR_USER.trust || {
+      C:5, Q:5, K:5, RTX:50, TF:50, tier:"Acquaintance"
+    };
+
+    const alpha = 0.2;  // 20% new / 80% history
+
+    const Cnew   = tOld.C   * (1 - alpha) + Cexp            * alpha;
+    const Qnew   = tOld.Q   * (1 - alpha) + Qexp            * alpha;
+    const Knew   = tOld.K   * (1 - alpha) + Kexp            * alpha;
+    const RTXnew = tOld.RTX * (1 - alpha) + RTXP_gain_0_100 * alpha;
+
+    const Ccl   = clamp01(Cnew);
+    const Qcl   = clamp01(Qnew);
+    const Kcl   = clamp01(Knew);
+    const RTXcl = clamp01(RTXnew);
+
+    // 4) Recompute TF + tier using computeTF
+    const tTemp    = { C: Ccl, Q: Qcl, K: Kcl, RTX: RTXcl };
+    const TFp      = computeTF(tTemp);
+    const tier     = tierFromTF(TFp);
+    const tUpdated = { ...tTemp, TF: TFp, tier };
+
+    SESSION.user.trust = tUpdated;
+    saveSession();
+
+    // 5) Mark connection reviewed / close when both sides complete review
+    const conns = Store.get(DB_KEYS.connections,[]);
+    const c     = conns.find(x=>x.id===connection_id);
+    if(c){
+      c.reviewed_by = (c.reviewed_by || []).concat([me]);
+      if((c.reviewed_by || []).length >= 2) c.state = "closed";
+      Store.set(DB_KEYS.connections, conns);
+    }
+
+    return {
+      ok: true,
+      review_state: "submitted",
+      trust: tUpdated,
+      rt_experience: {
+        character_1_10: Cexp,
+        quality_1_10:   Qexp,
+        contribution_1_10: Kexp,
+        experienceAvg_1_10,
+        RTXP_gain_0_100
+      }
+    };
+  },
+
+  /* ---- Gate check: reviews before new experiences ---------------------- */
+  "/gate/can-start": ()=>{
+    if(!FLAGS.enforceReviewBeforeNewExperience){
+      return { ok:true, can_start:true, reason:null, pending:[] };
+    }
+    const conns = Store.get(DB_KEYS.connections,[]);
+    const me    = SESSION.user.id || ABR_USER.id;
+
+    const need = conns
+      .filter(c => c.state === "confirmed" && !(c.reviewed_by || []).includes(me))
+      .map(c => c.id);
+
+    return {
+      ok: true,
+      can_start: need.length === 0,
+      reason: need.length ? "review_pending" : null,
+      pending: need
+    };
+  },
+
+  /* ---- Telemetry stub -------------------------------------------------- */
+  "/v1/telemetry/evt": ()=>({ok:true})
+};
+
+/* ========================================================================
+   API PROXY & QUEUE (REMOTE vs LOCAL)
+   ======================================================================== */
+
+async function remoteCall(path,body){
+  const r = await fetch(API_BASE + path, {
+    method:"POST",
+    headers:{
+      "Content-Type":"application/json",
+      ...(SESSION.csrf ? {"X-CSRF":SESSION.csrf} : {})
+    },
+    body: JSON.stringify({
+      ...body,
+      session_id: SESSION.id,
+      client: { app:"ABR", bot:"MrConnect", version: ABR_VERSION }
+    })
+  });
+  if(!r.ok) throw new Error("net");
+  return r.json();
+}
+
+async function localCall(path,body){
+  if(typeof ROUTES[path] !== "function") return {ok:false, error:"no_local_route"};
+  return ROUTES[path](body || {});
+}
+
+function enqueue(path,body){
+  Store.push(DB_KEYS.queue, {
+    id: newId("q"),
+    path,
+    body,
+    ts: Date.now()
+  });
+}
+
+async function syncQueue(){
+  if(!navigator.onLine) return;
+  const q = Store.get(DB_KEYS.queue,[]);
+  if(!q.length) return;
+  const rest = [];
+  for(const item of q){
+    try { await remoteCall(item.path, item.body); }
+    catch(_){ rest.push(item); }
+  }
+  Store.set(DB_KEYS.queue, rest);
+  SESSION.lastSync = Date.now();
+  saveSession();
+}
+
+async function api(path,body){
+  try{
+    const data = await remoteCall(path,body);
+    SESSION.online = true;
+    saveSession();
+    return data;
+  }catch(_){
+    SESSION.online = false;
+    saveSession();
+    const local = await localCall(path,body);
+    if(["/auth/signup","/connections/create","/connections/confirm","/reviews/submit"].includes(path)){
+      enqueue(path,body);
+      setTimeout(syncQueue,1000);
+    }
+    return local;
+  }
+}
+
+window.addEventListener("online", syncQueue);
+
+/* ========================================================================
+   BOT API (USED BY UI)
+   ======================================================================== */
+
+function tipByTier(){
+  const t = ABR_USER.trust.tier;
+  if(t === "Acquaintance") return "Verify to unlock visibility. Keep posts public, kind, low-pressure.";
+  if(t === "Ally")         return "You’re building trust. Clear public invites work best.";
+  return "Thanks for leading with care. Your posts set culture. 🛡️";
+}
+
+const BotAPI = {
+  async bootstrap(){
+    const local = {
+      trustTip: tipByTier(),
+      localIdeas:
+        `${ABR_MISSION} Neighbors around ${ABR_USER.zip_code} connect in low-pressure ways (porch talks, stroller walks, mellow trail laps).`
+    };
+    const data = await api("/bot/bootstrap", {
+      user_id: ABR_USER.id,
+      zip: ABR_USER.zip_code,
+      regionId: ABR_USER.regionId,
+      verifiedLevel: ABR_USER.verifiedLevel,
+      trust: ABR_USER.trust,
+      trust_tier: ABR_USER.trust.tier
+    });
+    if(data?.csrf){
+      SESSION.csrf = data.csrf;
+      saveSession();
+    }
+    return data
+      ? { trustTip: data.trustTip || local.trustTip, localIdeas: data.localIdeas || local.localIdeas }
+      : { ...local };
+  },
+
+  async assistDraft(draft){
+    const rf = redFlags(ABR_USER, draft);
+    if(rf.flagged){
+      try { api("/v1/telemetry/evt",{name:"red_flag",props:{reasons:rf.reasons}}); }
+      catch(_){ /* noop */ }
+    }
+
+    const local = runCfs({
+      user_id: ABR_USER.id,
+      zip_code: ABR_USER.zip_code,
+      draft_body: draft,
+      channel: "public_post"
+    });
+
+    if(local.blocked){
+      return { local, backend:null, offline:ABR_BACKEND_OFFLINE_NOTIFIED, redflags:rf };
+    }
+
+    const data = await api("/bot/assist-draft",{
+      user_id: ABR_USER.id,
+      zip: ABR_USER.zip_code,
+      trust: ABR_USER.trust,
+      draft_body: draft,
+      red_flags: rf
+    });
+
+    if(data?.trust?.TF){
+      ABR_USER.trust.TF   = data.trust.TF;
+      ABR_USER.trust.tier = tierFromTF(data.trust.TF);
+      ABR_USER.trust_tier = ABR_USER.trust.tier;
+    }
+
+    return {
+      local,
+      backend: data || null,
+      offline: !data,
+      redflags: rf
+    };
+  },
+
+  async gate(){
+    return api("/gate/can-start",{});
+  },
+
+  async createConnection(payload){
+    return api("/connections/create", payload);
+  },
+
+  async confirmConnection(payload){
+    return api("/connections/confirm", payload);
+  },
+
+  async pendingReviews(){
+    return api("/reviews/pending",{});
+  },
+
+  async submitReview(payload){
+    return api("/reviews/submit", payload);
+  },
+
+  async signupLocal(payload){
+    return api("/auth/signup", payload);
+  }
+};
+
+/* ========================================================================
+   REGION/IP SOFT GATE (OPTIONAL)
+   ======================================================================== */
+
+async function fetchRegionGate(){
+  if(!FLAGS.requireCountyGate) return { allowed:true };
+  try{
+    const r = await fetch(API_BASE + "/v1/region/gate",{method:"POST"});
+    if(r.ok) return r.json();
+  }catch(_){}
+  return { allowed:true, reason:"offline" };
+}
+
+/* ========================================================================
+   TELEMETRY (LOW NOISE)
+   ======================================================================== */
+
+async function sendEvent(name, props={}){
+  if(!FLAGS.telemetry) return;
+  try{
+    await api("/v1/telemetry/evt",{name,props});
+  }catch(_){}
+}
+
+/* ========================================================================
+   ACCESSIBILITY HELPERS
+   ======================================================================== */
+
+function trapFocus(container){
+  function onKey(e){
+    if(e.key!=="Tab") return;
+    const focusables = container.querySelectorAll(
+      "button, [href], input, textarea, [tabindex]:not([tabindex='-1'])"
+    );
+    if(!focusables.length) return;
+    const first = focusables[0];
+    const last  = focusables[focusables.length-1];
+    if(e.shiftKey && document.activeElement===first){
+      last.focus(); e.preventDefault();
+    }else if(!e.shiftKey && document.activeElement===last){
+      first.focus(); e.preventDefault();
+    }
+  }
+  container.addEventListener("keydown", onKey);
+  return ()=>container.removeEventListener("keydown", onKey);
+}
+
+/* ========================================================================
+   UI & STYLES (MR CONNECT v2 VISUAL)
+   ======================================================================== */
+
+const CSS = `
+:root{
+  --bg:#0B0F14;
+  --card:#141A22;
+  --txt:#F4F8FB;
+  --sub:#A0B1C3;
+  --g:linear-gradient(135deg,#00F5FF 0%,#FF5FE1 45%,#FFD84A 100%);
+}
+@media (prefers-reduced-motion: reduce){
+  #abrConnectBtn,
+  #abrConnectBtn:hover {
+    transition:none !important;
+    transform:none !important;
+    animation:none !important;
+  }
+}
+
+/* Big corner avatar + label */
+#abrConnectBtn{
+  position:fixed;
+  bottom:2rem;
+  right:2rem;
+  z-index:2147483647;
+  font-size:4.4rem;
+  line-height:1;
+  cursor:pointer;
+  transition:transform .25s ease-out;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  width:4.4rem;
+  height:4.4rem;
+  border-radius:999px;
+  background:radial-gradient(circle at 30% 0,#101822 0,#04070b 60%);
+  border:1px solid rgba(0,245,255,.55);
+  box-shadow:0 0 24px rgba(0,245,255,.7);
+  filter:drop-shadow(0 0 16px rgba(0,245,255,.7));
+  animation:mcFloat 3.4s ease-in-out infinite, mcGlow 5s ease-in-out infinite;
+}
+#abrConnectBtn::before{
+  content:"";
+  position:absolute;
+  inset:-14px;
+  border-radius:999px;
+  background:
+    radial-gradient(circle at 30% 0, rgba(0,245,255,.85), transparent 55%),
+    radial-gradient(circle at 70% 100%, rgba(255,149,0,.85), transparent 60%);
+  opacity:.8;
+  filter:blur(18px);
+  z-index:-1;
+}
+#abrConnectBtn:hover{
+  transform:translateY(-4px) scale(1.06);
+}
+
+/* Sunrise bob + glow */
+@keyframes mcFloat{
+  0%,100%{ transform:translateY(0); }
+  50%{    transform:translateY(-6px); }
+}
+@keyframes mcGlow{
+  0%{
+    box-shadow:0 0 22px rgba(0,245,255,.7),0 0 50px rgba(0,245,255,.4);
+    filter:drop-shadow(0 0 18px rgba(0,245,255,.8));
+  }
+  50%{
+    box-shadow:0 0 22px rgba(255,149,0,.9),0 0 50px rgba(255,149,0,.5);
+    filter:drop-shadow(0 0 18px rgba(255,149,0,.9));
+  }
+  100%{
+    box-shadow:0 0 22px rgba(0,245,255,.7),0 0 50px rgba(0,245,255,.4);
+    filter:drop-shadow(0 0 18px rgba(0,245,255,.8));
+  }
+}
+
+/* Idle label – fixed text, under him, right-aligned */
+#abrConnectHint{
+  position:fixed;
+  bottom:0.9rem;
+  right:2rem;
+  z-index:2147483647;
+  background:rgba(11,15,20,.95);
+  color:#F4F8FB;
+  font-size:.74rem;
+  padding:.3rem .7rem;
+  border-radius:999px;
+  border:1px solid rgba(0,245,255,.25);
+  backdrop-filter:blur(10px);
+  pointer-events:none;
+  white-space:nowrap;
+  text-align:right;
+}
+
+/* Sliding panel */
+#abrPanel{
+  position:fixed;
+  bottom:6.5rem;
+  right:2rem;
+  width:340px;
+  max-width:90%;
+  max-height:78vh;
+  display:none;
+  flex-direction:column;
+  background:#141A22;
+  color:#F4F8FB;
+  border-radius:12px;
+  border:1px solid rgba(255,255,255,.08);
+  box-shadow:0 40px 80px rgba(0,0,0,.8);
+}
+#abrHead{
+  background:var(--g);
+  color:#000;
+  border-radius:12px 12px 0 0;
+  padding:.7rem 1rem;
+  display:flex;
+  justify-content:space-between;
+  align-items:flex-start;
+  font-weight:600;
+}
+#abrTabs{
+  display:flex;
+  gap:.4rem;
+  padding:.5rem .8rem;
+  border-bottom:1px solid rgba(255,255,255,.08);
+  background:rgba(0,245,255,.05);
+}
+.tab{
+  font-size:.72rem;
+  border:1px solid rgba(255,255,255,.2);
+  background:rgba(255,255,255,.06);
+  color:#fff;
+  border-radius:999px;
+  padding:.2rem .55rem;
+  cursor:pointer;
+}
+.tab[data-active="true"]{
+  background:#fff;
+  color:#000;
+  border-color:#fff;
+}
+#abrLog{
+  flex:1 1 auto;
+  min-height:120px;
+  max-height:260px;
+  overflow:auto;
+  padding:1rem;
+  display:flex;
+  flex-direction:column;
+  gap:.4rem;
+}
+.msg{
+  background:rgba(255,255,255,.06);
+  border:1px solid rgba(255,255,255,.08);
+  border-radius:10px;
+  padding:.55rem .7rem;
+  font-size:.8rem;
+  line-height:1.4;
+  max-width:90%;
+}
+.msg.user{
+  margin-left:auto;
+  color:#00F5FF;
+  border-color:rgba(0,245,255,.4);
+  background:rgba(0,245,255,.12);
+}
+.msg.warn{
+  background:rgba(255,216,74,.15);
+  border:1px solid #FFD84A;
+  color:#FFD84A;
+  font-weight:600;
+}
+.abrPill{
+  font-size:.64rem;
+  border:1px solid rgba(255,255,255,.16);
+  background:rgba(255,255,255,.06);
+  color:#CFE7F7;
+  border-radius:999px;
+  padding:.2rem .5rem;
+  margin:.2rem .25rem 0 0;
+  display:inline-block;
+}
+#abrInput{
+  border-top:1px solid rgba(255,255,255,.08);
+  background:#0B0F14;
+  border-radius:0 0 12px 12px;
+  padding:.7rem;
+  display:flex;
+  flex-direction:column;
+  gap:.5rem;
+}
+#abrTa{
+  min-height:48px;
+  max-height:96px;
+  border-radius:8px;
+  border:1px solid rgba(255,255,255,.18);
+  background:rgba(255,255,255,.03);
+  color:#F4F8FB;
+  padding:.5rem .6rem;
+  resize:none;
+}
+#abrSend{
+  border:none;
+  border-radius:8px;
+  background:var(--g);
+  color:#000;
+  padding:.55rem .7rem;
+  font-weight:700;
+  cursor:pointer;
+}
+small.chip{
+  font-size:.65rem;
+  font-weight:700;
+  color:#000;
+  background:#fff;
+  border-radius:6px;
+  padding:0 .4rem;
+  line-height:1.4;
+}
+#abrFooterBtns{
+  display:flex;
+  gap:.4rem;
+  flex-wrap:wrap;
+}
+.abrBtn{
+  border:1px solid rgba(255,255,255,.2);
+  background:rgba(255,255,255,.06);
+  color:#fff;
+  border-radius:8px;
+  padding:.35rem .6rem;
+  font-size:.75rem;
+  cursor:pointer;
+}
+.abrBtn.primary{
+  background:#fff;
+  color:#000;
+  border-color:#fff;
+}
+.abrField{
+  width:100%;
+  padding:.45rem .55rem;
+  border-radius:8px;
+  border:1px solid rgba(255,255,255,.18);
+  background:rgba(255,255,255,.04);
+  color:#F4F8FB;
+  margin-top:.35rem;
+}
+`;
+
+/* ========================================================================
+   UI BOOTSTRAP & INTERACTION
+   ======================================================================== */
+
+function el(t,a={},h=""){
+  const e = document.createElement(t);
+  Object.entries(a).forEach(([k,v])=>e.setAttribute(k,v));
+  if(h) e.innerHTML = h;
+  return e;
+}
+function pushMsg(log,t,cls=""){
+  const d = el("div",{class:"msg"+(cls?(" "+cls):"")});
+  d.textContent = t;
+  log.appendChild(d);
+  log.scrollTop = log.scrollHeight;
+}
+function tierChip(){
+  const t = ABR_USER.trust.tier;
+  return t==="Guardian" ? "🛡️ guardian"
+       : t==="Ally"     ? "✅ ally"
+       :                  "🌱 acquaintance";
+}
+
+function initUI(){
+  if(document.getElementById("abrConnectBtn")) return;
+
+  /* ---- Inject styles --------------------------------------------------- */
+  const style = el("style",{id:"abrConnectStyles"});
+  style.textContent = CSS;
+  document.head.appendChild(style);
+
+  /* ---- Corner avatar + label + panel ---------------------------------- */
+  const btn  = el("div",{
+    id:"abrConnectBtn",
+    role:"button",
+    "aria-label":"Open Mr Connect",
+    "data-first":""
+  },"🤖");
+
+  const hint = el("div",{
+    id:"abrConnectHint"
+  },"Hi! I’m Mr Connect");
+
+  const panel = el("div",{
+    id:"abrPanel",
+    role:"dialog",
+    "aria-modal":"false",
+    "aria-hidden":"true",
+    "aria-label":"Mr Connect"
+  });
+
+  panel.innerHTML = `
+    <div id="abrHead">
+      <div>
+        <div style="display:flex;gap:.4rem;align-items:center;">
+          <span>🤖 Mr Connect</span>
+          <span class="chip">${tierChip()}</span>
+        </div>
+        <div style="font-size:.72rem;color:#222">
+          A Better Rent — Purely Connecting™ • ${ABR_USER.zip_code}
+        </div>
+      </div>
+      <button id="abrClose" aria-label="Close" class="abrBtn" data-last>✕</button>
+    </div>
+    <div id="abrTabs" role="tablist" aria-label="Mr Connect tabs">
+      <button class="tab" role="tab" aria-selected="true"  data-tab="assist" data-active="true">Assist</button>
+      <button class="tab" role="tab" aria-selected="false" data-tab="connect">Connect</button>
+      <button class="tab" role="tab" aria-selected="false" data-tab="reviews">Reviews</button>
+      <button class="tab" role="tab" aria-selected="false" data-tab="signup">Sign up</button>
+    </div>
+    <div id="abrLog" role="log" aria-live="polite"></div>
+    <div id="abrInput">
+      <label for="abrTa" style="position:absolute;left:-9999px;">Write a draft</label>
+      <textarea id="abrTa" placeholder="Type a post idea. I’ll make it ABR-safe. (Add [avail: Today | Evening])"></textarea>
+      <div id="abrAvail" style="display:flex;flex-wrap:wrap;gap:.35rem;"></div>
+      <div id="abrFooterBtns">
+        <button id="abrSend" class="abrBtn primary">Get Safe Version →</button>
+        <button id="abrStartConn" class="abrBtn">Start Connection</button>
+        <button id="abrCheckGate" class="abrBtn">Check Gate</button>
+        <button id="abrOpenSignup" class="abrBtn">Quick Signup</button>
+      </div>
+    </div>
+  `;
+
+  document.body.append(btn, hint, panel);
+
+  /* ---- Focus trap for dialog ------------------------------------------ */
+  let releaseTrap = ()=>{};
+  function openPanel(){
+    panel.style.display = "flex";
+    panel.setAttribute("aria-hidden","false");
+    releaseTrap = trapFocus(panel);
+    setTab("assist"); // greet + bootstrap
+    const ta = panel.querySelector("#abrTa");
+    if(ta) ta.focus();
+    sendEvent("panel_open");
+  }
+  function closePanel(){
+    panel.style.display = "none";
+    panel.setAttribute("aria-hidden","true");
+    releaseTrap();
+    btn.focus();
+  }
+
+  /* ---- DOM references -------------------------------------------------- */
+  const log         = panel.querySelector("#abrLog");
+  const ta          = panel.querySelector("#abrTa");
+  const close       = panel.querySelector("#abrClose");
+  const send        = panel.querySelector("#abrSend");
+  const startConn   = panel.querySelector("#abrStartConn");
+  const checkGate   = panel.querySelector("#abrCheckGate");
+  const quickSignup = panel.querySelector("#abrOpenSignup");
+  const tabs        = [...panel.querySelectorAll(".tab")];
+  const availWrap   = panel.querySelector("#abrAvail");
+
+  /* ---- Availability chips ---------------------------------------------- */
+  if(FLAGS.showAvailChips){
+    const chips = [
+      "Today","Tomorrow","Sat","Sun",
+      "Weekdays","Weekend",
+      "Morning","Afternoon","Evening","Daylight hours"
+    ];
+    chips.forEach(lbl=>{
+      const b = el("button",{type:"button",class:"abrPill"},lbl);
+      b.onclick = ()=>{
+        const cur = ta.value;
+        const m   = /\[avail:([^\]]*)\]/i.exec(cur);
+        if(m){
+          const list = m[1].split("|").map(x=>x.trim()).filter(Boolean);
+          if(!list.includes(lbl)) list.push(lbl);
+          ta.value = cur.replace(/\[avail:[^\]]*\]/i,`[avail: ${list.join(" | ")}]`);
+        }else{
+          ta.value = (cur.trim() ? (cur.trim()+" ") : "") + `[avail: ${lbl}]`;
+        }
+        ta.dispatchEvent(new Event("input"));
+      };
+      availWrap.appendChild(b);
+    });
+  }
+
+  /* ---- Tabs logic: Assist / Connect / Reviews / Signup ----------------- */
+  function setTab(name){
+    tabs.forEach(t=>{
+      const active = (t.dataset.tab === name);
+      t.dataset.active = active ? "true" : "false";
+      t.setAttribute("aria-selected", active ? "true" : "false");
+    });
+    log.innerHTML = "";
+
+    if(name === "assist"){
+      pushMsg(
+        log,
+        "I help you write ABR-safe, non-transactional, public-spot invites.\n" +
+        ABR_MISSION
+      );
+      regionGateNote(log);
+      BotAPI.bootstrap().then(b=>{
+        pushMsg(log, b.trustTip);
+        pushMsg(log, b.localIdeas);
+      });
+
+    } else if(name === "connect"){
+      pushMsg(
+        log,
+        "Start a connection when your message feels good and public-spot friendly. I’ll apply safety language."
+      );
+
+    } else if(name === "reviews"){
+      pushMsg(
+        log,
+        "After each shared experience, quickly rate Character, Quality, and Contribution (1–10) to grow Reputational Trust XP."
+      );
+      BotAPI.pendingReviews().then(r=>{
+        if(r?.pending?.length){
+          r.pending.forEach(p=>{
+            pushMsg(
+              log,
+              `Pending review for connection ${p.connection_id} with ${p.other_user.display_name}.`,
+              "warn"
+            );
+          });
+        }else{
+          pushMsg(log,"No reviews pending. You’re clear.");
+        }
+      });
+
+    } else if(name === "signup"){
+      renderSignupForm();
+    }
+  }
+
+  /* ---- Draft assist (Get Safe Version) --------------------------------- */
+  let lastSend = 0;
+  function trySend(){
+    const now = Date.now();
+    if(now - lastSend < caps().cooldown) return;
+    lastSend = now;
+
+    const draft = ta.value.trim();
+    if(!draft) return;
+
+    pushMsg(log, draft, "user");
+    ta.value = "";
+
+    BotAPI.assistDraft(draft).then(({local,backend,offline,redflags})=>{
+      if(redflags?.elevated){
+        pushMsg(log,"Heads-up: verifying your profile helps neighbors feel safer connecting.");
+      }
+
+      const sugList = backend?.approvedSuggestions?.length
+        ? backend.approvedSuggestions
+        : [{clean_body: local.clean_body || local.clean}];
+
+      pushMsg(log,"Here’s a safer way to say that:");
+      sugList
+        .slice(0, caps().maxSugs)
+        .forEach(s => pushMsg(log, s.clean_body || local.clean_body));
+
+      pushMsg(
+        log,
+        local.user_facing_note || "Meet in public, be kind, keep it simple."
+      );
+
+      if(offline && !ABR_BACKEND_OFFLINE_NOTIFIED){
+        pushMsg(log,"Local suggestion mode active.");
+        ABR_BACKEND_OFFLINE_NOTIFIED = true;
+      }
+    });
+  }
+
+  /* ---- Connection start (applies CFS + gate) --------------------------- */
+  async function handleStartConnection(){
+    const gate = await BotAPI.gate();
+    if(!gate.can_start){
+      pushMsg(log,"Quick review needed before starting something new.","warn");
+      for(const cid of gate.pending){
+        await renderReviewUI(cid);
+      }
+      pushMsg(log,"Thanks! Gate cleared. You can start a new connection now.");
+      return;
+    }
+
+    const draft   = ta.value.trim();
+    const cleaned = runCfs({
+      user_id: ABR_USER.id,
+      zip_code: ABR_USER.zip_code,
+      draft_body: draft,
+      channel: "public_post"
+    });
+
+    if(cleaned.blocked){
+      pushMsg(log,"Try rephrasing to keep it public and non-transactional.","warn");
+      return;
+    }
+
+    const res = await BotAPI.createConnection({
+      text: cleaned.clean_body,
+      tags: [],
+      soft_availability: cleaned.avail || [],
+      visibility: "local"
+    });
+
+    if(res?.ok){
+      pushMsg(log,"Connection posted (draft cleaned). Share: " + res.share_url);
+    }
+  }
+
+  /* ----------------------------------------------------------------------
+     REVIEW UI (RTXP PER EXPERIENCE)
+     - Character 1–10
+     - Quality 1–10
+     - Contribution 1–10
+     ---------------------------------------------------------------------- */
+  async function renderReviewUI(connection_id){
+    return new Promise(resolve=>{
+      const box = el("div",{class:"msg"});
+      box.innerHTML = `
+        <div style="font-weight:700;margin-bottom:.25rem;">
+          Quick Review for this shared experience
+        </div>
+
+        <label>
+          Character (1–10)
+          <input id="rChar" class="abrField" type="number" min="1" max="10" value="10">
+          <small style="font-size:.7rem;opacity:.8;display:block;">
+            Did they show up respectfully, kind, and low-pressure?
+          </small>
+        </label>
+
+        <label>
+          Quality (1–10)
+          <input id="rQual" class="abrField" type="number" min="1" max="10" value="10">
+          <small style="font-size:.7rem;opacity:.8;display:block;">
+            Did the experience feel genuinely good and worth your time?
+          </small>
+        </label>
+
+        <label>
+          Contribution (1–10)
+          <input id="rCon" class="abrField" type="number" min="1" max="10" value="10">
+          <small style="font-size:.7rem;opacity:.8;display:block;">
+            Did they actually bring something to the table (gear, effort, ideas, reliability)?
+          </small>
+        </label>
+
+        <button class="abrBtn primary" id="rSubmit">Submit review</button>
+      `;
+      log.appendChild(box);
+      log.scrollTop = log.scrollHeight;
+
+      box.querySelector("#rSubmit").onclick = async ()=>{
+        const C = +box.querySelector("#rChar").value || 10;
+        const Q = +box.querySelector("#rQual").value || 10;
+        const K = +box.querySelector("#rCon").value || 10;
+
+        const answers = {
+          character_1_10:    C,
+          quality_1_10:      Q,
+          contribution_1_10: K
+        };
+
+        const r = await BotAPI.submitReview({ connection_id, answers });
+
+        const avg  = (C + Q + K) / 3;
+        const gain = Math.round(avg * 10);
+
+        pushMsg(
+          log,
+          `Review submitted. RTXP gained: +${gain}. Your current tier: ${(r?.trust?.tier || ABR_USER.trust.tier)}.`
+        );
+
+        box.remove();
+        resolve();
+      };
+    });
+  }
+
+  /* ---- Signup form (inline quick version) ------------------------------- */
+  function renderSignupForm(){
+    log.innerHTML = "";
+    const card = el("div",{class:"msg"});
+    card.innerHTML = `
+      <div style="font-weight:700;margin-bottom:.25rem;">
+        Quick Signup (offline-friendly)
+      </div>
+      <input id="suName"  class="abrField" placeholder="Name"  autocomplete="name">
+      <input id="suZip"   class="abrField" placeholder="ZIP Code" inputmode="numeric" autocomplete="postal-code">
+      <input id="suEmail" class="abrField" placeholder="Email" autocomplete="email">
+      <input id="suPhone" class="abrField" placeholder="Phone (optional)" autocomplete="tel">
+      <div style="display:flex;gap:.4rem;margin-top:.4rem;">
+        <button id="suDo" class="abrBtn primary">Create</button>
+        <a class="abrBtn" href="${CFG.signup}" target="_blank" rel="noreferrer">
+          Open full signup
+        </a>
+      </div>
+    `;
+    log.appendChild(card);
+
+    card.querySelector("#suDo").onclick = async ()=>{
+      const name  = card.querySelector("#suName").value.trim();
+      const zip   = card.querySelector("#suZip").value.trim();
+      const email = card.querySelector("#suEmail").value.trim();
+      const phone = card.querySelector("#suPhone").value.trim();
+
+      if(!name || !zip || !email){
+        pushMsg(log,"Name, ZIP, and Email are required.","warn");
+        return;
+      }
+
+      const res = await BotAPI.signupLocal({
+        name, zip, email, phone_optional: phone
+      });
+      if(res?.ok){
+        pushMsg(log,"Welcome, " + (res.user?.display_name || "Neighbor") + "!");
+      }
+    };
+  }
+
+  /* ---- Region soft-gate message ---------------------------------------- */
+  async function regionGateNote(host){
+    const gate = await fetchRegionGate();
+    if(gate && gate.allowed === false){
+      pushMsg(
+        host,
+        "We’re soft-launching by county. Looks like you’re outside our pilot area. You can still explore drafts, but posting may be limited.",
+        "warn"
+      );
+    }
+  }
+
+  /* ---- Manual gate check button ---------------------------------------- */
+  function checkGateNow(){
+    BotAPI.gate().then(g=>{
+      if(g.can_start){
+        pushMsg(log,"Gate clear. You can start a new connection.");
+      }else{
+        pushMsg(log,"You have reviews to finish: " + g.pending.join(", "), "warn");
+      }
+    });
+  }
+
+  /* ---- Event wiring ----------------------------------------------------- */
+  btn.addEventListener("click", openPanel);
+  btn.addEventListener("keydown",e=>{
+    if(e.key==="Enter" || e.key===" "){
+      e.preventDefault();
+      openPanel();
+    }
+  });
+  close.addEventListener("click", closePanel);
+
+  send.addEventListener("click", trySend);
+  ta.addEventListener("keydown",e=>{
+    if(e.key==="Enter" && !e.shiftKey){
+      e.preventDefault();
+      trySend();
+    }
+    if(e.key==="Escape"){
+      closePanel();
+    }
+  });
+
+  startConn.addEventListener("click", handleStartConnection);
+  checkGate.addEventListener("click", checkGateNow);
+  quickSignup.addEventListener("click", ()=> setTab("signup"));
+}
+
+/* ========================================================================
+   BOOTSTRAP
+   ======================================================================== */
+
+function boot(){
+  if(document.body) initUI();
+  else document.addEventListener("DOMContentLoaded", initUI, {once:true});
+}
+boot();
+
+/* ========================================================================
+   DEBUG HOOKS (OPTIONAL)
+   ======================================================================== */
+
+window.ABR_DEBUG = {
+  version: ABR_VERSION,
+  runCfs,
+  computeTF,
+  tierFromTF,
+  createDemoConnection: async (text)=>
+    BotAPI.createConnection({text,tags:[],soft_availability:[],visibility:"local"})
+};
+})();
+</script>
