@@ -539,52 +539,102 @@ const rocketBadge = q('#rocketBadge');
 const offState = q('#offState');
 const onState  = q('#onState');
 
+const LS = {
+  email: 'abtr_email',
+  paid: 'abtr_paid',
+  lastSession: 'abtr_last_session_id',
+  intent: 'abtr_checkout_intent',
+  confirmationSentPrefix: 'abtr_confirmation_sent_' // + sessionId
+};
+
+function showOnly(which){
+  // which: "step1" | "step2" | "paid"
+  if(which === 'paid'){
+    successBanner.style.display='block';
+    step1.style.display='none';
+    step2.style.display='none';
+    badgeCard.style.display='block';
+    return;
+  }
+  successBanner.style.display='none';
+  badgeCard.style.display='none';
+  step1.style.display = (which === 'step1') ? 'block' : 'none';
+  step2.style.display = (which === 'step2') ? 'block' : 'none';
+}
+
+function resetCheckoutState({ keepEmail=true } = {}){
+  if(!keepEmail) localStorage.removeItem(LS.email);
+  localStorage.removeItem(LS.intent);
+  localStorage.removeItem(LS.lastSession);
+  // don't clear LS.paid here; that's a “real” state once verified
+}
+
+/* Send confirmation (only once per session) */
+async function sendConfirmationOnce(sessionId){
+  if(!sessionId) return;
+  const sentKey = LS.confirmationSentPrefix + sessionId;
+  if(localStorage.getItem(sentKey) === '1') return;
+
+  try{
+    const res = await fetch('/api/send-confirmation',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ session_id: sessionId })
+    });
+    if(res.ok){
+      localStorage.setItem(sentKey,'1');
+    } else {
+      // don’t block UX on email failure
+      console.warn('send-confirmation failed', await res.text());
+    }
+  }catch(e){
+    console.warn('send-confirmation error', e);
+  }
+}
+
 function unlockFounders({ email, sessionId }){
-  localStorage.setItem('abtr_paid','true');
-  localStorage.setItem('abtr_checkout_verified','true');
-  if(email) localStorage.setItem('abtr_email', email);
-  if(sessionId) localStorage.setItem('abtr_last_session_id', sessionId);
+  localStorage.setItem(LS.paid,'true');
+  localStorage.removeItem(LS.intent); // IMPORTANT: stop “Step2 forever”
+  if(email) localStorage.setItem(LS.email, email);
+  if(sessionId) localStorage.setItem(LS.lastSession, sessionId);
 
-  successBanner.style.display='block';
-  step1.style.display='none';
-  step2.style.display='none';
-  badgeCard.style.display='block';
-
+  showOnly('paid');
   createConfetti();
   showToast('Welcome, Founding Member! 🚀');
 
-  // Optional confirmation email (non-blocking)
-  try{
-    if(email){
-      fetch('/api/send-confirmation',{
-        method:'POST',
-        headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({ email, session_id: sessionId || null })
-      }).catch(()=>{});
-    }
-  }catch(_){}
+  // fire-and-forget
+  sendConfirmationOnce(sessionId);
 }
 
-/* Checkout */
+/* Verify helper used by BOTH auto-verify and the button */
+async function verifySession(sessionId){
+  const v = await fetch('/api/verify-session?session_id='+encodeURIComponent(sessionId), { cache:'no-store' });
+  if(!v.ok) throw new Error('Verify request failed: ' + v.status);
+  return await v.json(); // { paid, email, ... }
+}
+
+/* Checkout submit */
 form.addEventListener('submit', async (e)=>{
   e.preventDefault();
   setStatus(statusMessage,'','error');
 
   const email = emailInput.value.trim();
+  const consent = !!agreeCheckbox.checked;
+
   if(!validEmail(email)){
     setStatus(statusMessage,'That email looks off—try again?','error');
     return;
   }
-  if(!agreeCheckbox.checked){
+  if(!consent){
     setStatus(statusMessage,'Please agree to receive product updates.','error');
     return;
   }
 
-  localStorage.setItem('abtr_email', email);
-  localStorage.setItem('abtr_checkout_intent', 'started');
+  localStorage.setItem(LS.email, email);
   displayEmail && (displayEmail.textContent = email);
 
-  ctaButton.disabled=true; ctaButton.textContent='Preparing secure checkout…';
+  ctaButton.disabled = true;
+  ctaButton.textContent = 'Preparing secure checkout…';
 
   try{
     const origin = location.origin;
@@ -594,33 +644,42 @@ form.addEventListener('submit', async (e)=>{
     const res = await fetch('/api/create-checkout-session',{
       method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({ email, success_url, cancel_url })
+      body: JSON.stringify({ email, consent, source: 'founders_page', success_url, cancel_url })
     });
 
-    if(!res.ok) throw new Error('Failed to create checkout session');
-    const data = await res.json();
+    const dataText = await res.text();
+    if(!res.ok) throw new Error(dataText || 'Failed to create checkout session');
+
+    const data = JSON.parse(dataText);
     const sessionId = data.sessionId || data.id;
-    if (!sessionId) throw new Error("Missing session id from server");
-    localStorage.setItem("abtr_last_session_id", sessionId);
+    if(!sessionId) throw new Error('Missing session id from server');
+
+    // Only mark “intent started” AFTER we successfully got a sessionId
+    localStorage.setItem(LS.intent, 'started');
+    localStorage.setItem(LS.lastSession, sessionId);
+
     const { error } = await stripe.redirectToCheckout({ sessionId });
     if(error) throw error;
+
   }catch(err){
     console.error(err);
+    // IMPORTANT: do not trap user in Step2 on error
+    resetCheckoutState({ keepEmail:true });
     setStatus(statusMessage,'Could not start Checkout. Please try again.','error');
-    ctaButton.disabled=false; ctaButton.textContent='Continue to Secure Checkout →';
+    ctaButton.disabled=false;
+    ctaButton.textContent='Continue to Secure Checkout →';
+    showOnly('step1');
   }
 });
 
-/* Step 2 Verify button (FIXED + functional) */
+/* Manual verify button */
 verifyButton.addEventListener('click', async ()=>{
   setStatus(verifyMessage,'','error');
 
-  const sessionId =
-    qs('session_id') ||
-    localStorage.getItem('abtr_last_session_id');
-
+  const sessionId = qs('session_id') || localStorage.getItem(LS.lastSession);
   if(!sessionId){
-    setStatus(verifyMessage,'I couldn’t find a checkout session to verify. Please return from Stripe using the success link, or try checkout again.','error');
+    setStatus(verifyMessage,'I couldn’t find a checkout session to verify. Please try checkout again.','error');
+    showOnly('step1');
     return;
   }
 
@@ -628,20 +687,19 @@ verifyButton.addEventListener('click', async ()=>{
   verifyButton.textContent = 'Verifying…';
 
   try{
-    const v = await fetch('/api/verify-session?session_id='+encodeURIComponent(sessionId), { cache:'no-store' });
-    if(!v.ok) throw new Error('Verify request failed');
-    const { paid, email } = await v.json();
-
-    if(paid){
-      const finalEmail = email || localStorage.getItem('abtr_email') || emailInput.value.trim();
+    const out = await verifySession(sessionId);
+    if(out.paid){
+      const finalEmail = out.email || localStorage.getItem(LS.email) || '';
       unlockFounders({ email: finalEmail || null, sessionId });
       setStatus(verifyMessage,'Payment verified ✅ Perks unlocked!','success');
     }else{
       setStatus(verifyMessage,'Not verified yet. If you JUST paid, wait ~15 seconds and try again.','error');
+      showOnly('step2');
     }
   }catch(err){
     console.warn(err);
     setStatus(verifyMessage,'Could not verify yet. Please try again in a moment.','error');
+    showOnly('step2');
   }finally{
     verifyButton.disabled = false;
     verifyButton.textContent = 'I’ve completed payment';
@@ -654,54 +712,52 @@ async function handleReturnFromStripe(){
   const sessionId = qs('session_id');
   const canceled = qs('canceled');
 
-  if(sessionId) localStorage.setItem('abtr_last_session_id', sessionId);
+  if(sessionId) localStorage.setItem(LS.lastSession, sessionId);
+
+  // If already verified previously, just show paid
+  if(localStorage.getItem(LS.paid) === 'true'){
+    showOnly('paid');
+    return;
+  }
 
   if(canceled){
     showToast('Checkout canceled.');
-    step2.style.display='block';
-
-    // Clean URL
+    resetCheckoutState({ keepEmail:true });
+    showOnly('step1');
     if(history.replaceState){ history.replaceState({}, document.title, location.origin + location.pathname); }
     return;
   }
 
-  if(success==='true'){
-    successBanner.style.display='block';
+  if(success === 'true' && sessionId){
+    // Do NOT show thank-you yet; we only show it if paid is true
+    showOnly('step2');
+    setStatus(verifyMessage,'Checking your payment…','success');
 
-    let verified=true, emailFromStripe=null;
-
-    if(sessionId){
-      try{
-        const v=await fetch('/api/verify-session?session_id='+encodeURIComponent(sessionId), { cache:'no-store' });
-        if(v.ok){
-          const { paid, email } = await v.json();
-          verified=!!paid;
-          emailFromStripe=email||null;
-        } else {
-          verified=false;
-        }
-      }catch(e){
-        console.warn('Verify skipped:', e);
-        verified=false;
+    try{
+      const out = await verifySession(sessionId);
+      if(out.paid){
+        const finalEmail = out.email || localStorage.getItem(LS.email) || '';
+        unlockFounders({ email: finalEmail || null, sessionId });
+      }else{
+        // keep on step2, allow manual retry
+        setStatus(verifyMessage,'Payment still processing. Tap “I’ve completed payment” in a few seconds.','error');
+        showOnly('step2');
       }
-    }else{
-      verified=false;
+    }catch(e){
+      setStatus(verifyMessage,'We couldn’t auto-verify yet. Tap “I’ve completed payment”.','error');
+      showOnly('step2');
     }
 
-    if(verified){
-      const finalEmail = emailFromStripe || localStorage.getItem('abtr_email') || '';
-      unlockFounders({ email: finalEmail || null, sessionId: sessionId || null });
-    }else{
-      step2.style.display='block';
-      showToast('We could not auto-verify yet. Tap “I’ve completed payment”.');
-    }
-
-    // Clean URL (safe because we stored session_id)
     if(history.replaceState){ history.replaceState({}, document.title, location.origin + location.pathname); }
+    return;
+  }
+
+  // Normal load: Step2 ONLY if we actually have a session to verify
+  const hasSession = !!localStorage.getItem(LS.lastSession);
+  if(hasSession){
+    showOnly('step2');
   }else{
-    if(localStorage.getItem('abtr_checkout_intent')==='started'){
-      step2.style.display='block';
-    }
+    showOnly('step1');
   }
 }
 
@@ -730,17 +786,10 @@ toggleSwitch.addEventListener('keydown',(e)=>{ if(e.key==='Enter'||e.key===' '){
 
 /* Init */
 (function init(){
-  const saved = localStorage.getItem('abtr_email');
+  const saved = localStorage.getItem(LS.email);
   if(saved){
     if(emailInput) emailInput.value=saved;
     if(displayEmail) displayEmail.textContent=saved;
-  }
-
-  if(localStorage.getItem('abtr_paid')==='true'){
-    successBanner.style.display='block';
-    step1.style.display='none';
-    step2.style.display='none';
-    badgeCard.style.display='block';
   }
 
   updateRocketState();
