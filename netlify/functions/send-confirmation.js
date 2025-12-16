@@ -17,18 +17,31 @@ function safeJsonParse(body) {
   try { return JSON.parse(body); } catch { return null; }
 }
 
+function normalizeEmail(v) {
+  return String(v ?? "")
+    .trim()
+    .replace(/[\u200B-\u200D\uFEFF]/g, "") // zero-width chars
+    .replace(/\u00A0/g, " ")               // non-breaking space
+    .replace(/\s+/g, "")                   // no whitespace inside email
+    .replace(/[),.;:]+$/g, "");            // strip trailing punctuation
+}
+
 function isEmail(v) {
-  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(v || "").trim());
+  const e = normalizeEmail(v);
+  return /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/i.test(e);
 }
 
 async function postToAppsScript(payload) {
   const url = process.env.APPS_SCRIPT_URL;
   if (!url) throw new Error("Missing APPS_SCRIPT_URL");
+
+  // IMPORTANT: Netlify functions should run Node 18+ for global fetch()
   const res = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
   });
+
   const text = await res.text();
   let data = null;
   try { data = JSON.parse(text); } catch {}
@@ -42,17 +55,16 @@ exports.handler = async (event) => {
   const parsed = safeJsonParse(event.body);
   if (parsed === null) return json(400, { error: "Invalid JSON body" });
 
-  const email = String(parsed.email || "").trim();
   const sessionId = String(parsed.session_id || "").trim();
-
-  if (!isEmail(email)) return json(400, { error: "A valid email is required" });
   if (!/^cs_(test|live)_[A-Za-z0-9]+$/.test(sessionId)) {
     return json(400, { error: "Invalid session_id format" });
   }
 
   try {
-    // 1) Verify payment with Stripe
-    const session = await stripe.checkout.sessions.retrieve(sessionId);
+    // 1) Retrieve session (expand customer is helpful if you ever switch to customer=...)
+    const session = await stripe.checkout.sessions.retrieve(sessionId, {
+      expand: ["customer"],
+    });
 
     const paid =
       session.status === "complete" &&
@@ -62,7 +74,31 @@ exports.handler = async (event) => {
       return json(200, { ok: true, paid: false, message: "Not paid yet" });
     }
 
-    // 2) Log to Google Sheet + send email via Apps Script
+    // 2) Pull email FROM STRIPE (this is the key fix)
+    const email =
+      normalizeEmail(
+        session.customer_details?.email ||
+        session.customer_email ||
+        session.customer?.email || // only if expanded customer is an object
+        ""
+      );
+
+    if (!isEmail(email)) {
+      return json(200, {
+        ok: true,
+        paid: true,
+        sheet_email_ok: false,
+        error: "Paid, but Stripe session did not contain a usable email.",
+        debug_email_fields: {
+          customer_details_email: session.customer_details?.email || null,
+          customer_email: session.customer_email || null,
+          customer_object_email:
+            typeof session.customer === "object" ? (session.customer.email || null) : null,
+        },
+      });
+    }
+
+    // 3) Send to Apps Script
     const secret = process.env.APPS_SCRIPT_SECRET;
     if (!secret) throw new Error("Missing APPS_SCRIPT_SECRET");
 
@@ -75,10 +111,13 @@ exports.handler = async (event) => {
       status: "paid",
       source: "stripe_checkout",
       drive_url: driveUrl,
+
+      // optional useful fields
+      amount_total: session.amount_total ?? null,
+      currency: session.currency ?? null,
+      mode: session.mode ?? null,
     });
 
-    // If Apps Script fails, we still return paid=true (payment is real),
-    // but expose the logging/email error so you can fix it.
     if (!result.ok || !result.data?.ok) {
       return json(200, {
         ok: true,
