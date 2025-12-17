@@ -892,7 +892,7 @@
       tgt.textContent = s.slice(0,i) + ((i%2) ? " " : "");
       i++;
       if(i<=s.length){ setTimeout(step, CFG.typewriterSpeed); }
-      else{ line++; i=0; setTimeout(step, 600); }
+      else{ line++; i=0; setTimeout(step, 3000); }
     };
     step();
   }

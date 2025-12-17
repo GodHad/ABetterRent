@@ -115,6 +115,33 @@ header.header{text-align:center;padding:88px 0 108px}
 .toggle-states{display:flex;gap:8px;justify-content:center;font-size:.98rem;color:rgba(255,255,255,.6)}
 .toggle-state.active{color:var(--cyan);font-weight:700}
 
+ .glass{background:rgba(255,255,255,.05);backdrop-filter:blur(20px);border:1px solid rgba(255,255,255,.1);border-radius:16px}
+.card{background:rgba(255,255,255,.08);backdrop-filter:blur(15px);border:1px solid rgba(255,255,255,.15);border-radius:12px;transition:.3s ease}
+.card:hover{background:rgba(255,255,255,.12);border-color:rgba(0,212,255,.3);transform:translateY(-2px)}
+.neon-text{background:linear-gradient(45deg,var(--cyan),var(--green),var(--orange));-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;filter:drop-shadow(0 0 20px rgba(0,212,255,.5))}
+.neon-glow{box-shadow:0 0 20px rgba(0,212,255,.3),0 0 40px rgba(0,212,255,.1)}
+.container{max-width:1200px;margin:0 auto;padding:0 20px;position:relative;z-index:1}
+
+.visuals{padding:10px 0 30px}
+.visual-grid{
+  display:grid;
+  grid-template-columns:1fr;
+  gap:20px;
+  align-items:stretch;
+}
+.visual-card{
+  overflow:hidden;
+  border-radius:16px;
+  display:flex;
+  align-items:stretch;
+  justify-content:center;
+}
+.visual-card img{
+  width:100%;
+  height:100%;
+  object-fit:cover;
+}
+
 /* Perks (Left) */
 .perks-card{
   max-width:780px;margin:0 auto;height:100%;
@@ -433,6 +460,14 @@ footer{text-align:center;padding:44px 0;border-top:1px solid var(--border);margi
       </div>
     </div>
     <div class="hiw-note"><em>A Better Rent is a connection-based communication platform ONLY. A Better Rent LLC does not broker, own, or insure arrangements.</em></div>
+  </section>
+
+  <section class="visuals">
+    <div class="container visual-grid">
+      <div class="visual-card glass neon-glow">
+        <img src="images/rtx.png" alt="The Sharing Shift Starts With You" loading="lazy">
+      </div>
+    </div>
   </section>
 
   <!-- Transparency & Legacy -->
@@ -1096,7 +1131,7 @@ function mountUI(){
       tgt.textContent = s.slice(0,i) + ((i%2) ? " " : "");
       i++;
       if(i<=s.length){ setTimeout(step, CFG.typewriterSpeed); }
-      else{ line++; i=0; setTimeout(step, 600); }
+      else{ line++; i=0; setTimeout(step, 3000); }
     };
     step();
   }
